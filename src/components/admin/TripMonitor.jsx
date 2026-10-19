@@ -1,78 +1,81 @@
-// Live Trip Monitor — shows all trips and lets the owner tune their status.
+// Trip Monitor — mobile-optimized live status view.
 
-import { useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { Badge } from '../common/Badge';
-import { MapPin, Package, CheckCircle, Clock } from 'lucide-react';
-import { EmptyState } from '../common/EmptyState';
+import { MapPin, Package, CheckCircle2, Clock, Truck } from 'lucide-react';
 
-const statuses = [
-  { value: 'pending', label: 'Pending', icon: Clock, tone: 'pending' },
-  { value: 'dispatched', label: 'Dispatched', icon: Package, tone: 'dispatched' },
-  { value: 'out_for_delivery', label: 'Out for Delivery', icon: MapPin, tone: 'out' },
-  { value: 'completed', label: 'Completed', icon: CheckCircle, tone: 'settled' },
-];
-
-const statements = {};
-statuses.forEach((s) => { statements[s.value] = s; });
+const STATUS = {
+  pending:          { label: 'Pending',          tone: 'pending',    Icon: Clock },
+  dispatched:       { label: 'Dispatched',        tone: 'dispatched', Icon: Package },
+  out_for_delivery: { label: 'Out for Delivery',  tone: 'out',        Icon: Truck },
+  completed:        { label: 'Completed',         tone: 'settled',    Icon: CheckCircle2 },
+  settled:          { label: 'Settled',           tone: 'settled',    Icon: CheckCircle2 },
+};
 
 export default function TripMonitor() {
-  const { allTrips, billsByTrip, setTripStatus, toast } = useApp();
+  const { allTrips, allBills, setTripStatus, toast } = useApp();
   const trips = allTrips();
 
-  const changeStatus = (tripId, status) => {
-    setTripStatus(tripId, status);
-    toast(`Trip ${tripId} → ${statements[status]?.label}`, 'success');
-  };
-
   if (trips.length === 0) {
-    return <EmptyState icon={MapPin} title="No trips yet" description="Trips appear once orders are dispatched." />;
+    return (
+      <div className="flex flex-col items-center justify-center py-16 text-center">
+        <MapPin className="w-10 h-10 text-slate-200 mb-3" />
+        <p className="font-semibold text-slate-600">No trips yet</p>
+        <p className="text-sm text-slate-400 mt-1">Trips appear after you assign orders</p>
+      </div>
+    );
   }
 
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
-      <div className="px-5 py-4 border-b border-slate-200 bg-slate-50/60">
-        <div className="flex items-center gap-2">
-          <MapPin className="w-4 h-4 text-blue-600" />
-          <h2 className="text-base font-bold text-slate-900">Live Trip Monitor</h2>
-          <Badge tone="info">Live</Badge>
-        </div>
-      </div>
+    <div className="space-y-3">
+      {trips.map((t) => {
+        const bills = allBills().filter(b => b.tripId === t.id || t.billIds?.includes(b.id));
+        const settled = bills.filter(b => b.status === 'settled').length;
+        const total = bills.reduce((s, b) => s + b.amount, 0);
+        const s = STATUS[t.status] || STATUS.pending;
 
-      <ul className="divide-y divide-slate-100">
-        {trips.map((t) => {
-          const items = billsByTrip(t.id);
-          const s = statements[t.status] || statements.pending;
-          return (
-            <li key={t.id}>
-              <div className="px-5 py-4 hover:bg-slate-50 transition">
-                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className={`w-9 h-9 rounded-xl flex items-center justify-center ${s.tone === 'settled' ? 'bg-emerald-100 text-emerald-700' : s.tone === 'out' ? 'bg-amber-100 text-amber-700' : 'bg-blue-100 text-blue-700'}`}>
-                      {s.icon && <s.icon className="w-4 h-4" />}
-                    </div>
-                    <div className="min-w-0">
-                      <p className="font-bold text-slate-900 truncate">{t.tripNo}</p>
-                      <p className="text-xs text-slate-500">{t.deliveryBoy} · {items.length} order(s) · ₹{items.reduce((sum, b) => sum + b.amount, 0).toLocaleString('en-IN')}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <Badge tone={s.tone}>{s.label}</Badge>
-                    <select
-                      value={t.status}
-                      onChange={(e) => changeStatus(t.id, e.target.value)}
-                      className="appearance-none border border-slate-200 rounded-lg py-1.5 pl-2 pr-7 text-xs font-semibold text-slate-600 bg-white hover:bg-slate-50 focus:ring-2 focus:ring-blue-500 outline-none"
-                      aria-label={`Change status for ${t.tripNo}`}
-                    >
-                      {statuses.map((s) => <option key={s.value} value={s.value}>{s.label}</option>)}
-                    </select>
-                  </div>
-                </div>
+        return (
+          <div key={t.id} className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
+            {/* Trip row */}
+            <div className="flex items-center gap-3 px-4 py-3.5">
+              <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                t.status === 'completed' || t.status === 'settled' ? 'bg-emerald-100 text-emerald-600' :
+                t.status === 'out_for_delivery' ? 'bg-amber-100 text-amber-600' : 'bg-blue-100 text-blue-600'
+              }`}>
+                <s.Icon className="w-5 h-5" />
               </div>
-            </li>
-          );
-        })}
-      </ul>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="font-bold text-slate-900">{t.tripNo}</p>
+                  <Badge tone={s.tone}>{s.label}</Badge>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {t.deliveryBoy} · {bills.length} order(s) · {settled}/{bills.length} done · ₹{total.toLocaleString('en-IN')}
+                </p>
+              </div>
+            </div>
+
+            {/* Status selector */}
+            <div className="border-t border-slate-100 px-4 py-2.5 bg-slate-50/50">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-400 font-semibold shrink-0">Change:</span>
+                <select
+                  value={t.status}
+                  onChange={(e) => {
+                    setTripStatus(t.id, e.target.value);
+                    toast(`${t.tripNo} → ${STATUS[e.target.value]?.label}`, 'success');
+                  }}
+                  className="flex-1 border border-slate-200 rounded-lg py-1.5 px-2 text-xs font-semibold text-slate-600 bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                >
+                  {Object.entries(STATUS).filter(([k]) => k !== 'settled').map(([val, { label }]) => (
+                    <option key={val} value={val}>{label}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }

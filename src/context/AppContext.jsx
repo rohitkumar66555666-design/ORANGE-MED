@@ -1,12 +1,11 @@
-// AppContext — shared state synced via localStorage so Admin tab & Delivery tab stay connected.
+// AppContext — Supabase as primary DB, localStorage as offline fallback.
+// Real-time sync via Supabase channels (admin + delivery on different devices).
 
-import { createContext, useContext, useReducer, useCallback, useEffect } from 'react';
+import { createContext, useContext, useReducer, useCallback, useEffect, useRef } from 'react';
+import { supabase, isOnline } from '../services/supabase';
 
 const LS_KEY = 'orangemed_state';
 
-// ---------- Types & constants ----------
-export const VIEW = { ADMIN: 'admin', DELIVERY: 'delivery' };
-export const PAYMENT = { CASH: 'cash', UPI: 'upi', CREDIT: 'credit' };
 export const BILL_STATUS = {
   PENDING: 'pending',
   DISPATCHED: 'dispatched',
@@ -20,71 +19,88 @@ export const initialState = {
   trips: [],
   nextBillId: 1,
   nextTripId: 1,
+  loaded: false,
 };
 
-// ---------- Persist helpers ----------
-function loadState() {
+// ── localStorage helpers (offline fallback) ──────────────────────────────────
+function lsLoad() {
   try {
     const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return initialState;
-    return { ...initialState, ...JSON.parse(raw) };
-  } catch {
-    return initialState;
-  }
+    return raw ? { ...initialState, ...JSON.parse(raw), loaded: true } : { ...initialState, loaded: true };
+  } catch { return { ...initialState, loaded: true }; }
 }
 
-function saveState(state) {
+function lsSave(state) {
   try {
-    // only persist shared data — not toasts or view
     const { bills, trips, nextBillId, nextTripId } = state;
     localStorage.setItem(LS_KEY, JSON.stringify({ bills, trips, nextBillId, nextTripId }));
   } catch {}
 }
 
-// ---------- Reducer ----------
+// ── snake_case ↔ camelCase converters ────────────────────────────────────────
+function billFromRow(r) {
+  return {
+    id:             r.id,
+    billNo:         r.bill_no,
+    amount:         Number(r.amount) || 0,
+    paymentMode:    r.payment_mode,
+    pettyCashGiven: Number(r.petty_cash_given) || 0,
+    cashGiven:      Number(r.cash_given) || 0,
+    changeReturned: Number(r.change_returned) || 0,
+    collectedCash:  Number(r.collected_cash) || 0,
+    upiAmount:      Number(r.upi_amount) || 0,
+    isCredit:       r.is_credit || false,
+    signature:      r.signature || null,
+    tripId:         r.trip_id || null,
+    status:         r.status,
+    createdAt:      r.created_at,
+  };
+}
+
+function tripFromRow(r) {
+  return {
+    id:          r.id,
+    tripNo:      r.trip_no,
+    deliveryBoy: r.delivery_boy,
+    status:      r.status,
+    billIds:     r.bill_ids || [],
+    createdAt:   r.created_at,
+  };
+}
+
+// ── Reducer (pure, works for both online & offline) ──────────────────────────
 function appReducer(state, action) {
   switch (action.type) {
 
-    case 'SYNC': {
-      // incoming update from another tab via storage event
-      return { ...state, ...action.payload };
+    case 'LOAD': {
+      return { ...state, bills: action.bills, trips: action.trips, loaded: true };
     }
 
     case 'ADD_BILL': {
       const bill = {
-        id: state.nextBillId,
-        billNo: action.payload.billNo || `#${String(state.nextBillId).padStart(3, '0')}`,
-        customerName: action.payload.customerName,
-        customerPhone: action.payload.customerPhone,
-        amount: Number(action.payload.amount) || 0,
-        paymentMode: action.payload.paymentMode || 'cash',
-        cashGiven: 0,
-        changeReturned: 0,
-        collectedCash: 0,
-        upiAmount: 0,
-        isCredit: false,
-        signature: null,
-        tripId: null,
+        id:             action.payload.id,
+        billNo:         action.payload.billNo,
+        amount:         Number(action.payload.amount) || 0,
+        paymentMode:    action.payload.paymentMode || 'cash',
         pettyCashGiven: Number(action.payload.pettyCashGiven) || 0,
-        status: 'pending',
-        createdAt: new Date().toISOString(),
+        cashGiven:      0,
+        changeReturned: 0,
+        collectedCash:  0,
+        upiAmount:      0,
+        isCredit:       action.payload.paymentMode === 'credit',
+        signature:      null,
+        tripId:         null,
+        status:         'pending',
+        createdAt:      new Date().toISOString(),
       };
       return { ...state, bills: [...state.bills, bill], nextBillId: state.nextBillId + 1 };
     }
 
     case 'CREATE_TRIP': {
-      const { tripId, deliveryBoy, billIds } = action.payload;
+      const { trip, billIds } = action.payload;
       const bills = state.bills.map((b) =>
-        billIds.includes(b.id) ? { ...b, status: 'dispatched', tripId } : b
+        billIds.includes(b.id) ? { ...b, status: 'dispatched', tripId: trip.id } : b
       );
-      const trip = {
-        id: tripId,
-        tripNo: `TRIP-${tripId}`,
-        deliveryBoy,
-        status: 'out_for_delivery',
-        billIds,
-        createdAt: new Date().toISOString(),
-      };
       return { ...state, bills, trips: [...state.trips, trip], nextTripId: state.nextTripId + 1 };
     }
 
@@ -101,16 +117,16 @@ function appReducer(state, action) {
       const { id, mode, cashGiven } = action.payload;
       const bill = state.bills.find((b) => b.id === id);
       if (!bill || bill.status === 'settled') return state;
-
       const cash = Number(cashGiven) || 0;
       const updated = {
         ...bill,
-        paymentMode: mode,
-        cashGiven: mode === 'cash' ? cash : 0,
-        collectedCash: mode === 'cash' ? cash : 0,
+        paymentMode:    mode,
+        cashGiven:      mode === 'cash' ? cash : 0,
+        collectedCash:  mode === 'cash' ? cash : 0,
         changeReturned: mode === 'cash' ? Math.max(0, cash - bill.amount) : 0,
-        upiAmount: mode === 'upi' ? bill.amount : 0,
-        isCredit: mode === 'credit',        status: BILL_STATUS.SETTLED,
+        upiAmount:      mode === 'upi' ? bill.amount : 0,
+        isCredit:       mode === 'credit',
+        status:         BILL_STATUS.SETTLED,
       };
       return { ...state, bills: state.bills.map((b) => (b.id === id ? updated : b)) };
     }
@@ -125,23 +141,15 @@ function appReducer(state, action) {
     }
 
     case 'COMPLETE_TRIP': {
-      const { tripId } = action.payload;
-      const trip = state.trips.find((t) => t.id === tripId);
+      const trip = state.trips.find((t) => t.id === action.payload.tripId);
       if (!trip) return state;
       return {
         ...state,
-        trips: state.trips.map((t) => (t.id === tripId ? { ...t, status: BILL_STATUS.COMPLETED } : t)),
+        trips: state.trips.map((t) =>
+          t.id === action.payload.tripId ? { ...t, status: BILL_STATUS.COMPLETED } : t
+        ),
         bills: state.bills.map((b) =>
           trip.billIds.includes(b.id) ? { ...b, status: BILL_STATUS.SETTLED } : b
-        ),
-      };
-    }
-
-    case 'SETTLE_TRIP': {
-      return {
-        ...state,
-        trips: state.trips.map((t) =>
-          t.id === action.payload.tripId ? { ...t, status: BILL_STATUS.SETTLED } : t
         ),
       };
     }
@@ -155,101 +163,226 @@ function appReducer(state, action) {
       };
     }
 
-    case 'RESET': {
-      return initialState;
-    }
+    case 'RESET':
+      return { ...initialState, loaded: true };
 
-    case 'TOAST':
-    case 'CLEAR_TOASTS':
-      return state; // toasts handled separately below
+    // realtime patch from another device
+    case 'PATCH_BILL': {
+      const exists = state.bills.find(b => b.id === action.payload.id);
+      if (exists) {
+        return { ...state, bills: state.bills.map(b => b.id === action.payload.id ? { ...b, ...action.payload } : b) };
+      }
+      return { ...state, bills: [...state.bills, action.payload] };
+    }
+    case 'PATCH_TRIP': {
+      const exists = state.trips.find(t => t.id === action.payload.id);
+      if (exists) {
+        return { ...state, trips: state.trips.map(t => t.id === action.payload.id ? { ...t, ...action.payload } : t) };
+      }
+      return { ...state, trips: [...state.trips, action.payload] };
+    }
+    case 'REMOVE_BILL':
+      return { ...state, bills: state.bills.filter(b => b.id !== action.payload.id) };
 
     default:
       return state;
   }
 }
 
-// ---------- Context ----------
+// ── Context ───────────────────────────────────────────────────────────────────
 const AppContext = createContext();
 
 export function AppProvider({ children }) {
-  const [state, dispatch] = useReducer(appReducer, undefined, loadState);
+  const [state, dispatch] = useReducer(appReducer, { ...initialState });
+  const [toasts, setToasts] = useToastState();
+  const realtimeRef = useRef(null);
 
-  // Toasts live only in this tab — separate state
-  const [toasts, setToasts] = useToasts();
-
-  // Save to localStorage whenever shared state changes
+  // ── Initial load ────────────────────────────────────────────────────────────
   useEffect(() => {
-    saveState(state);
+    if (isOnline()) {
+      // Load from Supabase
+      Promise.all([
+        supabase.from('bills').select('*').order('id'),
+        supabase.from('trips').select('*').order('id'),
+      ]).then(([{ data: billRows }, { data: tripRows }]) => {
+        dispatch({
+          type: 'LOAD',
+          bills: (billRows || []).map(billFromRow),
+          trips: (tripRows || []).map(tripFromRow),
+        });
+      });
+    } else {
+      // Offline — load from localStorage
+      const saved = lsLoad();
+      dispatch({ type: 'LOAD', bills: saved.bills, trips: saved.trips });
+    }
+  }, []);
+
+  // ── Save to localStorage (offline backup always) ────────────────────────────
+  useEffect(() => {
+    if (state.loaded) lsSave(state);
   }, [state]);
 
-  // Listen for changes from OTHER tabs and sync
+  // ── Realtime subscription (Supabase) ────────────────────────────────────────
   useEffect(() => {
+    if (!isOnline()) return;
+
+    const channel = supabase
+      .channel('orangemed-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'bills' }, (payload) => {
+        if (payload.eventType === 'DELETE') {
+          dispatch({ type: 'REMOVE_BILL', payload: { id: payload.old.id } });
+        } else {
+          dispatch({ type: 'PATCH_BILL', payload: billFromRow(payload.new) });
+        }
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'trips' }, (payload) => {
+        if (payload.eventType !== 'DELETE') {
+          dispatch({ type: 'PATCH_TRIP', payload: tripFromRow(payload.new) });
+        }
+      })
+      .subscribe();
+
+    realtimeRef.current = channel;
+    return () => { supabase.removeChannel(channel); };
+  }, []);
+
+  // ── Cross-tab sync (localStorage, offline only) ─────────────────────────────
+  useEffect(() => {
+    if (isOnline()) return;
     const handler = (e) => {
       if (e.key !== LS_KEY || !e.newValue) return;
       try {
-        const incoming = JSON.parse(e.newValue);
-        dispatch({ type: 'SYNC', payload: incoming });
+        const saved = JSON.parse(e.newValue);
+        dispatch({ type: 'LOAD', bills: saved.bills || [], trips: saved.trips || [] });
       } catch {}
     };
     window.addEventListener('storage', handler);
     return () => window.removeEventListener('storage', handler);
   }, []);
 
-  // ---------- Actions ----------
-  const addBill = useCallback((input) => dispatch({ type: 'ADD_BILL', payload: input }), []);
+  // ── Actions ──────────────────────────────────────────────────────────────────
+  const addBill = useCallback(async (input) => {
+    if (isOnline()) {
+      const { data, error } = await supabase.from('bills').insert({
+        bill_no:          input.billNo || null,
+        amount:           Number(input.amount) || 0,
+        payment_mode:     input.paymentMode || 'cash',
+        petty_cash_given: Number(input.pettyCashGiven) || 0,
+        is_credit:        input.paymentMode === 'credit',
+        status:           'pending',
+      }).select().single();
+      if (!error && data) dispatch({ type: 'ADD_BILL', payload: billFromRow(data) });
+    } else {
+      dispatch({ type: 'ADD_BILL', payload: { ...input, id: state.nextBillId } });
+    }
+  }, [state.nextBillId]);
 
-  const createTrip = useCallback((deliveryBoy, billIds) => {
-    dispatch({ type: 'CREATE_TRIP', payload: { tripId: state.nextTripId, deliveryBoy, billIds } });
+  const createTrip = useCallback(async (deliveryBoy, billIds) => {
+    if (isOnline()) {
+      const tripNo = `TRIP-${Date.now()}`;
+      const { data: tripData, error: tErr } = await supabase.from('trips').insert({
+        trip_no:      tripNo,
+        delivery_boy: deliveryBoy,
+        status:       'out_for_delivery',
+        bill_ids:     billIds,
+      }).select().single();
+      if (tErr || !tripData) return;
+
+      // Update bills with tripId
+      await supabase.from('bills')
+        .update({ trip_id: tripData.id, status: 'dispatched' })
+        .in('id', billIds);
+
+      dispatch({ type: 'CREATE_TRIP', payload: { trip: tripFromRow(tripData), billIds } });
+    } else {
+      const tripId = state.nextTripId;
+      const trip = {
+        id: tripId, tripNo: `TRIP-${tripId}`,
+        deliveryBoy, status: 'out_for_delivery',
+        billIds, createdAt: new Date().toISOString(),
+      };
+      dispatch({ type: 'CREATE_TRIP', payload: { trip, billIds } });
+    }
   }, [state.nextTripId]);
 
-  const setTripStatus = useCallback((tripId, status) => {
+  const setTripStatus = useCallback(async (tripId, status) => {
+    if (isOnline()) {
+      await supabase.from('trips').update({ status }).eq('id', tripId);
+    }
     dispatch({ type: 'SET_TRIP_STATUS', payload: { tripId, status } });
   }, []);
 
-  const processBill = useCallback((id, mode, cashGiven) => {
+  const processBill = useCallback(async (id, mode, cashGiven) => {
+    const bill = state.bills.find((b) => b.id === id);
+    if (!bill) return;
+    const cash = Number(cashGiven) || 0;
+    const patch = {
+      payment_mode:    mode,
+      cash_given:      mode === 'cash' ? cash : 0,
+      collected_cash:  mode === 'cash' ? cash : 0,
+      change_returned: mode === 'cash' ? Math.max(0, cash - bill.amount) : 0,
+      upi_amount:      mode === 'upi' ? bill.amount : 0,
+      is_credit:       mode === 'credit',
+      status:          'settled',
+    };
+    if (isOnline()) {
+      await supabase.from('bills').update(patch).eq('id', id);
+    }
     dispatch({ type: 'PROCESS_BILL', payload: { id, mode, cashGiven } });
-  }, []);
+  }, [state.bills]);
 
-  const setSignature = useCallback((id, signature) => {
+  const setSignature = useCallback(async (id, signature) => {
+    if (isOnline()) {
+      await supabase.from('bills').update({ signature, is_credit: true }).eq('id', id);
+    }
     dispatch({ type: 'SET_SIGNATURE', payload: { id, signature } });
   }, []);
 
-  const completeTrip = useCallback((tripId) => {
+  const completeTrip = useCallback(async (tripId) => {
+    const trip = state.trips.find((t) => t.id === tripId);
+    if (!trip) return;
+    if (isOnline()) {
+      await supabase.from('trips').update({ status: 'completed' }).eq('id', tripId);
+      await supabase.from('bills').update({ status: 'settled' }).in('id', trip.billIds);
+    }
     dispatch({ type: 'COMPLETE_TRIP', payload: { tripId } });
-  }, []);
+  }, [state.trips]);
 
-  const settleTrip = useCallback((tripId) => {
-    dispatch({ type: 'SETTLE_TRIP', payload: { tripId } });
-  }, []);
-
-  const confirmSettlement = useCallback((tripId) => {
+  const confirmSettlement = useCallback(async (tripId) => {
+    if (isOnline()) {
+      await supabase.from('trips').update({ status: 'settled' }).eq('id', tripId);
+    }
     dispatch({ type: 'CONFIRM_SETTLEMENT', payload: { tripId } });
   }, []);
 
-  const reset = useCallback(() => {
-    dispatch({ type: 'RESET' });
+  const reset = useCallback(async () => {
+    if (isOnline()) {
+      await supabase.from('bills').delete().neq('id', 0);
+      await supabase.from('trips').delete().neq('id', 0);
+    }
     localStorage.removeItem(LS_KEY);
+    dispatch({ type: 'RESET' });
   }, []);
 
-  // Derived
-  const pendingBills = () => state.bills.filter((b) => b.status === 'pending').sort((a, b) => a.id - b.id);
-  const allTrips = () => state.trips;
-  const allBills = () => state.bills;
-  const billsByTrip = (tripId) => state.bills.filter((b) => b.tripId === tripId || (state.trips.find(t => t.id === tripId)?.billIds || []).includes(b.id));
-
-  const dayEndTotals = () => {
+  // ── Derived ──────────────────────────────────────────────────────────────────
+  const pendingBills  = () => state.bills.filter((b) => b.status === 'pending').sort((a, b) => a.id - b.id);
+  const allBills      = () => state.bills;
+  const allTrips      = () => state.trips;
+  const billsByTrip   = (tripId) => state.bills.filter((b) => b.tripId === tripId || (state.trips.find(t => t.id === tripId)?.billIds || []).includes(b.id));
+  const dayEndTotals  = () => {
     const bills = state.bills;
     return {
-      totalBilled: bills.reduce((s, b) => s + (b.amount || 0), 0),
-      collectedCash: bills.filter(b => b.paymentMode === 'cash').reduce((s, b) => s + (b.collectedCash || 0), 0),
-      upiPayments: bills.filter(b => b.paymentMode === 'upi').reduce((s, b) => s + (b.upiAmount || 0), 0),
-      creditAmount: bills.filter(b => b.paymentMode === 'credit').reduce((s, b) => s + (b.amount || 0), 0),
+      totalBilled:    bills.reduce((s, b) => s + (b.amount || 0), 0),
+      collectedCash:  bills.filter(b => b.paymentMode === 'cash').reduce((s, b) => s + (b.collectedCash || 0), 0),
+      upiPayments:    bills.filter(b => b.paymentMode === 'upi').reduce((s, b) => s + (b.upiAmount || 0), 0),
+      creditAmount:   bills.filter(b => b.paymentMode === 'credit').reduce((s, b) => s + (b.amount || 0), 0),
       changeReturned: bills.reduce((s, b) => s + (b.changeReturned || 0), 0),
-      openingChange: bills.reduce((s, b) => s + (b.pettyCashGiven || 0), 0),
-      pendingCount: bills.filter(b => b.status !== 'settled').length,
+      openingChange:  bills.reduce((s, b) => s + (b.pettyCashGiven || 0), 0),
     };
   };
 
+  // ── Toasts ───────────────────────────────────────────────────────────────────
   const toast = useCallback((message, type = 'success') => {
     const id = Date.now() + Math.random();
     setToasts((prev) => [...prev, { id, message, type }]);
@@ -261,9 +394,10 @@ export function AppProvider({ children }) {
   const value = {
     ...state,
     toasts,
+    isOnline: isOnline(),
     pendingBills,
-    allTrips,
     allBills,
+    allTrips,
     billsByTrip,
     dayEndTotals,
     addBill,
@@ -272,26 +406,19 @@ export function AppProvider({ children }) {
     processBill,
     setSignature,
     completeTrip,
-    settleTrip,
     confirmSettlement,
     reset,
     toast,
     clearToasts,
-    VIEW,
-    PAYMENT,
     BILL_STATUS,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 
-// Simple toasts hook
-function useToasts() {
-  const [toasts, setToasts] = useReducer((s, fn) => fn(s), []);
-  const setter = useCallback((fn) => {
-    if (typeof fn === 'function') setToasts(fn);
-    else setToasts(() => fn);
-  }, []);
+function useToastState() {
+  const [toasts, setToasts] = useReducer((s, fn) => (typeof fn === 'function' ? fn(s) : fn), []);
+  const setter = useCallback((fn) => setToasts(fn), []);
   return [toasts, setter];
 }
 
